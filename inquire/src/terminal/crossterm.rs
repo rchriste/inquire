@@ -326,6 +326,7 @@ impl From<KeyEvent> for Key {
 #[cfg(test)]
 mod test {
     use crate::terminal::Terminal;
+    #[cfg(unix)]
     use crate::ui::Color;
 
     use super::Attributes;
@@ -360,7 +361,6 @@ mod test {
         terminal.flush().unwrap();
         terminal.write("wow").unwrap();
 
-        #[cfg(unix)]
         assert_eq!(
             "testing writing wow",
             std::str::from_utf8(&terminal.get_buffer_content()).unwrap()
@@ -376,7 +376,6 @@ mod test {
         terminal.set_attributes(Attributes::BOLD).unwrap();
         terminal.reset_attributes().unwrap();
 
-        #[cfg(unix)]
         assert_eq!(
             "\x1B[1m\x1B[3m\x1B[1m\x1B[0m",
             std::str::from_utf8(&terminal.get_buffer_content()).unwrap()
@@ -392,13 +391,30 @@ mod test {
             .unwrap();
         terminal.reset_attributes().unwrap();
 
-        #[cfg(unix)]
         assert_eq!(
             "\x1B[1m\x1B[3m\x1B[0m",
             std::str::from_utf8(&terminal.get_buffer_content()).unwrap()
         );
     }
 
+    // NOTE:
+    // These two color tests are intentionally Unix-only.
+    //
+    // Crossterm decides at *runtime* whether to emit ANSI color escape codes on Windows.
+    // In terminals with VT/ANSI support enabled (e.g. Windows Terminal / ConPTY),
+    // `SetForegroundColor`/`SetBackgroundColor` serialize to the expected ANSI SGR bytes
+    // and these assertions would pass.
+    //
+    // However, in some Windows environments (notably certain CI setups or the Cursor
+    // integrated terminal), VT support is detected as off and crossterm falls back to
+    // WinAPI behavior, which results in reset-only sequences (`\x1b[m`) being written
+    // to an in-memory `Vec<u8>` writer. That makes byte-exact color output checks flaky
+    // on Windows, so we gate them to Unix for stability.
+    //
+    // There *is* a runtime ANSI-support check in crossterm, but it's not available as a
+    // compile-time cfg and can vary by host terminal, so a compile-time gate is the
+    // simplest way to keep tests deterministic.
+    #[cfg(unix)]
     #[test]
     fn fg_color_management() {
         let mut terminal = CrosstermTerminal::new_in_memory_output();
@@ -408,13 +424,13 @@ mod test {
         terminal.set_fg_color(Color::Black).unwrap();
         terminal.set_fg_color(Color::LightGreen).unwrap();
 
-        #[cfg(unix)]
         assert_eq!(
             "\x1B[38;5;9m\x1B[39m\x1B[38;5;0m\x1B[38;5;10m",
             std::str::from_utf8(&terminal.get_buffer_content()).unwrap()
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn bg_color_management() {
         let mut terminal = CrosstermTerminal::new_in_memory_output();
@@ -424,7 +440,6 @@ mod test {
         terminal.set_bg_color(Color::Black).unwrap();
         terminal.set_bg_color(Color::LightGreen).unwrap();
 
-        #[cfg(unix)]
         assert_eq!(
             "\x1B[48;5;9m\x1B[49m\x1B[48;5;0m\x1B[48;5;10m",
             std::str::from_utf8(&terminal.get_buffer_content()).unwrap()
