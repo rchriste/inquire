@@ -262,6 +262,51 @@ where
         Ok(())
     }
 
+    /// Returns the height that would be flushed to the terminal if the current frame
+    /// were finished now. This is the max between the last rendered frame and the
+    /// current frame, matching `finish_current_frame`'s clearing behavior.
+    pub fn current_flush_height(&self) -> Option<u16> {
+        match &self.state {
+            RenderState::ActiveRender {
+                last_rendered_frame,
+                current_frame,
+            } => Some(std::cmp::max(
+                last_rendered_frame.frame_size.height(),
+                current_frame.frame_size.height(),
+            )),
+            RenderState::Rendered(frame) => Some(frame.frame_size.height()),
+            RenderState::Initial => None,
+        }
+    }
+
+    /// Returns the terminal height associated with the current frame, if any.
+    pub fn current_terminal_height(&self) -> Option<u16> {
+        match &self.state {
+            RenderState::ActiveRender { current_frame, .. } => {
+                Some(current_frame.terminal_size.height())
+            }
+            RenderState::Rendered(frame) => Some(frame.terminal_size.height()),
+            RenderState::Initial => None,
+        }
+    }
+
+    /// Aborts the current frame without writing it to the terminal,
+    /// restoring the last rendered frame as the active state.
+    ///
+    /// This is useful for "preflight" renders (e.g., adaptive page sizing) where
+    /// an oversized frame should not be flushed to the real terminal.
+    pub fn abort_current_frame(&mut self) -> io::Result<()> {
+        let state = std::mem::take(&mut self.state);
+        self.state = match state {
+            RenderState::ActiveRender {
+                last_rendered_frame,
+                ..
+            } => RenderState::Rendered(last_rendered_frame),
+            other => other,
+        };
+        Ok(())
+    }
+
     pub fn finish_current_frame(&mut self, add_empty_line: bool) -> io::Result<()> {
         let (last_rendered_frame, mut current_frame) = match std::mem::take(&mut self.state) {
             RenderState::Rendered(_) | RenderState::Initial => {
@@ -549,6 +594,28 @@ mod test {
         } else {
             panic!("Expected cursor position to be set");
         }
+
+        Ok(())
+    }
+
+    #[test]
+    fn current_flush_height_is_max_of_last_and_current() -> InquireResult<()> {
+        let mut output = VecDeque::new();
+        let terminal = MockTerminal::new(&mut output).with_size(TerminalSize::default());
+        let mut renderer = FrameRenderer::new(terminal)?;
+
+        // First render with 3 lines.
+        renderer.start_frame()?;
+        renderer.write("a\nb\nc\n")?;
+        renderer.finish_current_frame(false)?;
+
+        assert_eq!(renderer.current_flush_height(), Some(3));
+
+        // Start a new frame that is shorter (1 line).
+        renderer.start_frame()?;
+        renderer.write("x\n")?;
+
+        assert_eq!(renderer.current_flush_height(), Some(3));
 
         Ok(())
     }

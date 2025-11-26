@@ -5,6 +5,7 @@ use crate::{
     formatter::OptionFormatter,
     input::{Input, InputActionResult},
     list_option::ListOption,
+    prompts::action::Action,
     prompts::prompt::{ActionResult, Prompt},
     type_aliases::Scorer,
     ui::SelectBackend,
@@ -182,6 +183,101 @@ where
         Ok(())
     }
 
+    fn prompt(mut self, backend: &mut Backend) -> InquireResult<Self::Output> {
+        // NOTE ABOUT OVERRIDING `Prompt::prompt`
+        //
+        // The base `Prompt::prompt` implementation (see `prompts/prompt.rs`) includes an
+        // explicit guideline to only override it with a strong reason. This override
+        // exists to implement an *adaptive page size* workaround for terminals where
+        // wrapped multi-line options can cause the rendered list to exceed the visible
+        // screen height and corrupt the UI.
+        //
+        // Why this cannot live in the base `Prompt::prompt` today:
+        //
+        // 1) **Prompt-specific knob**: Adaptive sizing needs to shrink
+        //    `self.config.page_size`. The base prompt is generic over `Self::Config`
+        //    and has no required interface to read/modify a "page size" field. Without
+        //    adding new trait requirements or hooks, the base prompt can't safely
+        //    mutate prompt-specific configuration.
+        //
+        // 2) **Preflight + abort**: The workaround must render into an in-memory frame,
+        //    compare the *flush height* (max of last/current frame heights) against
+        //    terminal height, and if oversized, abort without flushing and retry with a
+        //    smaller page size. The base prompt previously had no "abort and retry"
+        //    control flow, so we need to own the redraw path here.
+        //
+        // 3) **State correction**: After shrinking, we may need to clamp cursor/selection
+        //    indices and re-paginate. This adjustment is prompt-specific; the base
+        //    prompt cannot assume how to reconcile internal state for all prompt types.
+        //
+        // Future direction:
+        // If we want to move adaptive sizing into the base prompt for broader coverage,
+        // we should introduce a minimal opt-in trait/hook (e.g., "AdaptivePagePrompt")
+        // that exposes:
+        //   - current page size
+        //   - ability to set a smaller page size
+        //   - a hook to reconcile state after resize
+        // and have the default loop perform preflight/abort/retry only for prompts that
+        // implement that trait. Until such an abstraction exists, this local override
+        // is the smallest safe, semver-friendly fix.
+        //
+        <Self as Prompt<Backend>>::setup(&mut self)?;
+
+        let mut last_handle = ActionResult::NeedsRedraw;
+        let final_answer = loop {
+            if last_handle.needs_redraw() {
+                self.redraw_with_adaptive_page_size(backend)?;
+                last_handle = ActionResult::Clean;
+            }
+
+            let key = backend.read_key()?;
+            let action = Action::from_key(key, <Self as Prompt<Backend>>::config(&self));
+
+            if let Some(action) = action {
+                last_handle = match action {
+                    Action::Submit => {
+                        if let Some(answer) =
+                            <Self as Prompt<Backend>>::submit(&mut self)?
+                        {
+                            break answer;
+                        }
+                        ActionResult::NeedsRedraw
+                    }
+                    Action::Cancel => {
+                        let pre_cancel_result =
+                            <Self as Prompt<Backend>>::pre_cancel(&mut self)?;
+
+                        if pre_cancel_result {
+                            backend.frame_setup()?;
+                            backend.render_canceled_prompt(
+                                <Self as Prompt<Backend>>::message(&self),
+                            )?;
+                            backend.frame_finish(true)?;
+                            return Err(InquireError::OperationCanceled);
+                        }
+
+                        ActionResult::NeedsRedraw
+                    }
+                    Action::Interrupt => return Err(InquireError::OperationInterrupted),
+                    Action::Inner(inner_action) => {
+                        <Self as Prompt<Backend>>::handle(&mut self, inner_action)?
+                    }
+                };
+            }
+        };
+
+        let formatted = <Self as Prompt<Backend>>::format_answer(&self, &final_answer);
+
+        backend.frame_setup()?;
+        backend.render_prompt_with_answer(
+            <Self as Prompt<Backend>>::message(&self),
+            &formatted,
+        )?;
+        backend.frame_finish(true)?;
+
+        Ok(final_answer)
+    }
+
     fn submit(&mut self) -> InquireResult<Option<ListOption<T>>> {
         let answer = match self.has_answer_highlighted() {
             true => Some(self.get_final_answer()),
@@ -235,6 +331,52 @@ where
 
         if let Some(help_message) = self.help_message {
             backend.render_help_message(help_message)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a, T> SelectPrompt<'a, T>
+where
+    T: Display,
+{
+    fn redraw_with_adaptive_page_size<Backend>(&mut self, backend: &mut Backend) -> InquireResult<()>
+    where
+        Backend: SelectBackend,
+    {
+        let mut page_size = self.config.page_size.max(1);
+
+        loop {
+            backend.frame_setup()?;
+            self.render(backend)?;
+
+            // Use the height that would actually be flushed (max of last/current)
+            // to avoid scrolling when clearing a previously taller frame.
+            let frame_h = backend.current_flush_height().unwrap_or(0);
+            let term_h = backend.current_terminal_height().unwrap_or(u16::MAX);
+
+            if frame_h <= term_h || page_size <= 1 {
+                backend.frame_finish(false)?;
+                break;
+            }
+
+            // Oversized render: abort without flushing and reduce page size.
+            backend.frame_abort()?;
+
+            let mut new_size = (page_size as u32)
+                .saturating_mul(term_h.max(1) as u32)
+                .checked_div(frame_h.max(1) as u32)
+                .unwrap_or(1) as usize;
+
+            if new_size >= page_size {
+                new_size = page_size.saturating_sub(1).max(1);
+            }
+
+            page_size = new_size;
+            self.config.page_size = page_size;
+            // Ensure cursor stays within bounds after size change.
+            let _ = self.update_cursor_position(self.cursor_index.min(self.scored_options.len().saturating_sub(1)));
         }
 
         Ok(())

@@ -5,6 +5,7 @@ use crate::{
     formatter::MultiOptionFormatter,
     input::{Input, InputActionResult},
     list_option::ListOption,
+    prompts::action::Action,
     prompts::prompt::{ActionResult, Prompt},
     type_aliases::Scorer,
     ui::MultiSelectBackend,
@@ -266,6 +267,81 @@ where
         Ok(())
     }
 
+    fn prompt(mut self, backend: &mut Backend) -> InquireResult<Self::Output> {
+        // NOTE ABOUT OVERRIDING `Prompt::prompt`
+        //
+        // See the analogous comment in `select/prompt.rs`. In short: we override the
+        // base prompt loop here to implement adaptive page sizing for multi-line/wrapping
+        // option lists without changing the public `Prompt` trait.
+        //
+        // The default `Prompt::prompt` loop always flushes a frame immediately after
+        // `render(&self, ...)` with no chance to abort/retry, and it cannot mutate
+        // `self.config.page_size` because `Self::Config` is opaque at the trait level.
+        // MultiSelect also has prompt-specific state to reconcile (checked set, cursor)
+        // after resizing. Therefore, the redraw path is owned here via
+        // `redraw_with_adaptive_page_size`.
+        //
+        // Future direction: add a minimal opt-in adaptive-sizing trait/hook to the base
+        // prompt so list-style prompts (Select/MultiSelect/Text suggestions, etc.) can
+        // share this behavior without overrides.
+        //
+        <Self as Prompt<Backend>>::setup(&mut self)?;
+
+        let mut last_handle = ActionResult::NeedsRedraw;
+        let final_answer = loop {
+            if last_handle.needs_redraw() {
+                self.redraw_with_adaptive_page_size(backend)?;
+                last_handle = ActionResult::Clean;
+            }
+
+            let key = backend.read_key()?;
+            let action = Action::from_key(key, <Self as Prompt<Backend>>::config(&self));
+
+            if let Some(action) = action {
+                last_handle = match action {
+                    Action::Submit => {
+                        if let Some(answer) =
+                            <Self as Prompt<Backend>>::submit(&mut self)?
+                        {
+                            break answer;
+                        }
+                        ActionResult::NeedsRedraw
+                    }
+                    Action::Cancel => {
+                        let pre_cancel_result =
+                            <Self as Prompt<Backend>>::pre_cancel(&mut self)?;
+
+                        if pre_cancel_result {
+                            backend.frame_setup()?;
+                            backend.render_canceled_prompt(
+                                <Self as Prompt<Backend>>::message(&self),
+                            )?;
+                            backend.frame_finish(true)?;
+                            return Err(InquireError::OperationCanceled);
+                        }
+
+                        ActionResult::NeedsRedraw
+                    }
+                    Action::Interrupt => return Err(InquireError::OperationInterrupted),
+                    Action::Inner(inner_action) => {
+                        <Self as Prompt<Backend>>::handle(&mut self, inner_action)?
+                    }
+                };
+            }
+        };
+
+        let formatted = <Self as Prompt<Backend>>::format_answer(&self, &final_answer);
+
+        backend.frame_setup()?;
+        backend.render_prompt_with_answer(
+            <Self as Prompt<Backend>>::message(&self),
+            &formatted,
+        )?;
+        backend.frame_finish(true)?;
+
+        Ok(final_answer)
+    }
+
     fn submit(&mut self) -> InquireResult<Option<Vec<ListOption<T>>>> {
         let answer = match self.validate_current_answer()? {
             Validation::Valid => Some(self.get_final_answer()),
@@ -341,6 +417,56 @@ where
 
         if let Some(help_message) = self.help_message {
             backend.render_help_message(help_message)?;
+        }
+
+        Ok(())
+    }
+}
+
+impl<'a, T> MultiSelectPrompt<'a, T>
+where
+    T: Display,
+{
+    fn redraw_with_adaptive_page_size<Backend>(
+        &mut self,
+        backend: &mut Backend,
+    ) -> InquireResult<()>
+    where
+        Backend: MultiSelectBackend,
+    {
+        let mut page_size = self.config.page_size.max(1);
+
+        loop {
+            backend.frame_setup()?;
+            self.render(backend)?;
+
+            // Use the height that would actually be flushed (max of last/current)
+            // to avoid scrolling when clearing a previously taller frame.
+            let frame_h = backend.current_flush_height().unwrap_or(0);
+            let term_h = backend.current_terminal_height().unwrap_or(u16::MAX);
+
+            if frame_h <= term_h || page_size <= 1 {
+                backend.frame_finish(false)?;
+                break;
+            }
+
+            backend.frame_abort()?;
+
+            let mut new_size = (page_size as u32)
+                .saturating_mul(term_h.max(1) as u32)
+                .checked_div(frame_h.max(1) as u32)
+                .unwrap_or(1) as usize;
+
+            if new_size >= page_size {
+                new_size = page_size.saturating_sub(1).max(1);
+            }
+
+            page_size = new_size;
+            self.config.page_size = page_size;
+            let _ = self.update_cursor_position(
+                self.cursor_index
+                    .min(self.scored_options.len().saturating_sub(1)),
+            );
         }
 
         Ok(())

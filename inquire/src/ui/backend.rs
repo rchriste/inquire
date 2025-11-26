@@ -17,6 +17,15 @@ use super::{frame_renderer::FrameRenderer, InputReader};
 pub trait CommonBackend: InputReader {
     fn frame_setup(&mut self) -> Result<()>;
     fn frame_finish(&mut self, is_last_frame: bool) -> Result<()>;
+    /// Abort the current frame without flushing it to the terminal.
+    fn frame_abort(&mut self) -> Result<()>;
+
+    /// Height (rows) of the currently built frame, if any.
+    /// Height (rows) of the terminal size used for the current frame, if any.
+    fn current_terminal_height(&self) -> Option<u16>;
+    /// Height (rows) that would be flushed if the current frame were finished now.
+    /// This is the max between the last rendered and current frames.
+    fn current_flush_height(&self) -> Option<u16>;
 
     fn render_canceled_prompt(&mut self, prompt: &str) -> Result<()>;
     fn render_prompt_with_answer(&mut self, prompt: &str, answer: &str) -> Result<()>;
@@ -255,6 +264,18 @@ where
 
     fn frame_finish(&mut self, is_last_frame: bool) -> Result<()> {
         self.frame_renderer.finish_current_frame(is_last_frame)
+    }
+
+    fn frame_abort(&mut self) -> Result<()> {
+        self.frame_renderer.abort_current_frame()
+    }
+
+    fn current_terminal_height(&self) -> Option<u16> {
+        self.frame_renderer.current_terminal_height()
+    }
+
+    fn current_flush_height(&self) -> Option<u16> {
+        self.frame_renderer.current_flush_height()
     }
 
     fn render_canceled_prompt(&mut self, prompt: &str) -> Result<()> {
@@ -766,6 +787,20 @@ pub(crate) mod test {
                 panic!("No frame to finish");
             }
             Ok(())
+        }
+
+        fn frame_abort(&mut self) -> std::io::Result<()> {
+            // Discard the in-progress frame without saving it.
+            self.cur_frame = None;
+            Ok(())
+        }
+
+        fn current_terminal_height(&self) -> Option<u16> {
+            None
+        }
+
+        fn current_flush_height(&self) -> Option<u16> {
+            None
         }
 
         fn render_canceled_prompt(&mut self, prompt: &str) -> std::io::Result<()> {
