@@ -101,3 +101,7 @@ path = "enum_comprehensive.rs"
 [[example]]
 name = "enum_select_derive"
 path = "enum_select_derive.rs"
+
+[[example]]
+name = "select_wrapping_repro"
+path = "select_wrapping_repro.rs"
